@@ -1,0 +1,68 @@
+#!/gpfs1m/apps/apps/ruby2.0/bin/ruby
+
+require 'yaml'
+require 'time'
+require_relative 'lib/argparser.rb'
+
+class Transfer_list
+  
+  TFR_QUEUE_DIR = '/gpfs1m/Tfr_queue'
+  FAILED_STATE=0000 #Bad config file
+  CREATE_STATE=0200
+  READY_STATE=0600
+  RUN_STATE=0700
+  FIN_STATE=0400
+  ABORTED_STATE=0500 #Too many retries
+  
+  
+  def initialize(transfer_list)
+    @transfer_list = transfer_list
+  end
+      
+  def save_yaml
+    File.open("#{TFR_QUEUE_DIR}/#{@transfer_list[:control_file]}", "w+", CREATE_STATE) do |fd| 
+      #puts "#{TFR_QUEUE_DIR}/#{@transfer_list[:control_file]}"
+      YAML::dump(@transfer_list, fd)
+      fd.chmod(READY_STATE) #Ready to run.
+    end
+  end
+  
+  def to_s
+    YAML::dump(@transfer_list)
+  end
+  
+  def self.test_to_s
+    transfer_data = ArgParser.new(["--tc", "debug", "--sd", "src", "--dd","dest", "-f","src1","dest1", "-d","-f","src2", "dest2", "-f", "src3", "dest3", "-d"])
+    if transfer_data.nfiles > 0
+      tl = Transfer_list.new(transfer_data.argv)
+      puts tl.to_s
+    else
+      transfer_data.usage
+    end
+  end  
+  
+  def self.test_to_file
+    transfer_data = ArgParser.new(["--tc", "debug", "--sd", "src", "--dd","dest", "-f","src1","dest1", "-d","-f","src2", "dest2", "-f", "src3", "dest3", "-d"])
+    if transfer_data.nfiles > 0
+      tl = Transfer_list.new(transfer_data.argv)
+      tl.save_yaml
+    else
+      transfer_data.usage
+    end
+  end  
+end
+=begin
+Transfer_list.test_to_s
+Transfer_list.test_to_file
+exit(0)
+=end
+
+transfer_data = ArgParser.new(ARGV)
+
+if transfer_data.nfiles > 0
+  tl = Transfer_list.new(transfer_data.argv)
+  tl.save_yaml
+else
+  transfer_data.usage
+end
+

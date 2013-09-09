@@ -1,0 +1,212 @@
+#!/gpfs1m/apps/apps/ruby2.0/bin/ruby
+require 'yaml'
+require 'syslog'
+
+class Tfr_handler
+  
+  FAILED_STATE=0000 #Bad config causes this
+  CREATE_STATE=0200 
+  READY_STATE=0600
+  RUN_STATE=0700
+  FIN_STATE=0400
+  ABORTED_STATE=0500 #Too many retries
+
+  MAX_RETRIES = 5
+  attr_accessor :transfer_ctl
+  
+  def initialize(filename)
+    #Open syslog.
+    @log = Syslog.open('tfr_handler')    
+    #Open the user control file for this transfer.
+    @control_file = qualified_name('/gpfs1m/Tfr_queue/', filename)
+
+    security_check
+ 
+    
+    #Init transfer failed state to false.
+    @at_least_one_failed = false
+    
+    #Ensure control file is in the ready to execute state.
+    if (File.stat(@control_file).mode & 0777) != RUN_STATE
+      @log.err("File state not in RUN_STATE. Aborting #{@control_file}")
+      exit(-2)
+    end
+    
+    #Start processing
+    begin
+      @fd = File.open(@control_file, "r+") 
+    rescue Exception=>errormsg
+      @log.err("Error openning #{@control_file}: #{errormsg}")
+      exit(-3)
+    end
+    
+    process
+    
+    #Clean up.
+    @fd.close if @fd != nil
+    @user_log_fd.close if @user_log_fd != nil
+  end
+  
+  def security_check
+    #Find aut who is running the process
+    uid = Process.uid
+    gid = Process.gid
+    
+    #Root owned files are rejected, as this process must by restricted
+    #to users space.
+    if uid == 0 || gid  == 0
+      @log.err("Launched as root. Aborting #{@control_file}")
+      exit(-1)
+    else
+      @log.info("Processing '#{@control_file}' with UID #{uid}:#{gid}")
+    end
+  end
+
+  def set_env
+    ENV['PWD'] = @transfer_ctl[:pwd]
+    ENV['HOME'] = @transfer_ctl[:home]
+    ENV['USER'] = @transfer_ctl[:user]
+    ENV['LOGIN'] = @transfer_ctl[:user]
+    Dir.chdir(@transfer_ctl[:pwd]) #run as the user, in the directory the user was using at queue time
+  end
+
+  def process
+    #Read control file, and translate from YAML into @transfer_ctl
+    if (@transfer_ctl = YAML.load(@fd)) == nil
+      @log.err("YAML.load(#{@control_file}) returned nil")
+      @fd.chmod(FAILED_STATE) #Mark as a process failure.
+      return #No point in continuing.
+    end
+    
+    #Check if we are in debug mode.
+    @debug = ( @transfer_ctl[:tfr_command] == 'debug' ) || @transfer_ctl[:debug] == true
+    
+    #Set Open the user log file.
+    begin
+      @user_log = qualified_name(@transfer_ctl[:log_dir], @transfer_ctl[:transfer_log])
+      @log.info("User Log File: #{@user_log}") if @debug
+      @user_log_fd = File.open( @user_log, "a+") #Append, as this might not be the first attempt.
+      user_log(:info, "Processing Control file: #{@control_file}")    
+    rescue Exception=>errormsg
+      @log.err("Error openning #{@user_log}: #{errormsg}")
+    end
+
+    #perform the transfers
+    set_env  #Commands need to run in a minimal user environment.
+    transfer
+    
+    #Determine new state
+    if @at_least_one_failed
+      if @transfer_ctl[:retries] < @transfer_ctl[:maxretries]
+        #Requeue
+        @transfer_ctl[:retries] = @transfer_ctl[:retries] + 1
+        user_log(:warning, "Reinserting Control file into run queue. Retry #{@transfer_ctl[:retries]}: #{@control_file}")    
+        @new_state = READY_STATE #Mark as ready for processing. ie try the failed transfer again
+      else
+        #Abort
+        user_log(:alert, "Processing failed. Too many retries for #{@control_file}")    
+        @new_state = ABORTED_STATE #mark as aborted
+      end
+    else
+      #Clean completion
+      user_log(:info, "Processing Complete file: #{@control_file}")    
+      @new_state = FIN_STATE #Mark as completed
+    end
+    
+    #Save the control file with updates
+    @fd.rewind
+    YAML.dump(@transfer_ctl, @fd) #update the control file.
+    @fd.chmod(@new_state)
+  end
+  
+  def transfer
+    #For each file to transfer, exec transfer command.
+    @transfer_ctl[:files].each do |file_ent|
+      if(file_ent[:complete] == false)
+        #This file hasn't been transferred yet.
+        if(cmd = build_tfr_command(file_ent[:src],file_ent[:dest])) != nil
+          begin
+            #Run the command.
+            output = `#{cmd}`
+            exit_code = $?.exitstatus
+            if exit_code != 0
+              @at_least_one_failed = true
+              user_log(:err, "Tfr failed with #{exit_code}. CMD: #{cmd}")
+            else
+              file_ent[:complete] = true
+              file_ent[:time] = Time.now.strftime("%Y-%m-%dT%H:%M:%S")
+              user_log(:info, "Tfr: #{cmd}")
+              if(file_ent[:flags] == '-d' && @outbound) # && copy checksum ok
+                user_log(:info, "(not) Deleting src file: #{file_ent[:src]}")
+              end
+            end
+          rescue Exception => errormsg
+            @at_least_one_failed = true
+            user_log(:err, "Tfr failed with #{errormsg}. CMD: #{cmd}")
+          end
+        end
+      end 
+    end
+  end
+  
+  def build_tfr_command(source,destination)
+    #Valid cmds are iput (default), iget, cp, mv, gridput, gridget, scp
+    src = qualified_name(@transfer_ctl[:def_source_dir], source)
+    dest = qualified_name(@transfer_ctl[:def_destination_dir], destination)
+    return case(@transfer_ctl[:tfr_command])
+    when 'iput'; @outbound = true; "/gpfs1m/apps/utils/bin/iput -N 4 -f -K #{src} #{dest}"
+    when 'iget'; @outbound = false; "/gpfs1m/apps/utils/bin/iput -N 4 -f -K #{src} #{dest}"
+    when 'cp'; @outbound = true; "/bin/cp #{src} #{dest}"
+    when 'mv'; @outbound = true; "/bin/mv #{src} #{dest}"
+    when 'scp_get'; @outbound = false; "/usr/bin/scp #{@transfer_ctl[:remote_user]}#{@transfer_ctl[:remote_host]}:#{src} #{dest}"
+    when 'scp_put'; @outbound = true; "/usr/bin/scp #{src} #{@transfer_ctl[:remote_user]}#{@transfer_ctl[:remote_host]}:#{dest}"
+    when 'debug'; @outbound = false; "/bin/echo #{src} #{dest}" #display, but don't run anything
+    # when 'grid_get'; @outbound = false; "uberftp #{src} #{dest}"
+    # when 'grid_put'; @outbound = true; "uberftp #{src} #{dest}"
+    else
+      user_log(:err, "Transfer command is nil")
+      nil
+    end
+  end
+  
+  def qualified_name(path, filename)
+    if filename[0,1] == '/' || path == nil || path == ''
+      return filename
+    end
+    return "#{path}/#{filename}"
+  end
+  
+  def user_log(level, message)
+    case(level)
+    when :info;
+      puts("#{Time.now.strftime("%Y-%m-%dT%H:%M:%S")} Info: #{message}") if @debug
+      @user_log_fd.puts("#{Time.now.strftime("%Y-%m-%dT%H:%M:%S")} Info: #{message}") if @user_log_fd != nil
+      @log.info(message)
+    when :warning;
+      puts("#{Time.now.strftime("%Y-%m-%dT%H:%M:%S")} Warning: #{message}") if @debug
+      @user_log_fd.puts("#{Time.now.strftime("%Y-%m-%dT%H:%M:%S")} Warning: #{message}") if @user_log_fd != nil
+      @log.warning(message)
+    when :notice;
+      puts("#{Time.now.strftime("%Y-%m-%dT%H:%M:%S")} Notice: #{message}") if @debug
+      @user_log_fd.puts("#{Time.now.strftime("%Y-%m-%dT%H:%M:%S")} Notice: #{message}") if @user_log_fd != nil
+      @log.notice(message)
+    when :err;
+      puts("#{Time.now.strftime("%Y-%m-%dT%H:%M:%S")} Error: #{message}") if @debug
+      @user_log_fd.puts("#{Time.now.strftime("%Y-%m-%dT%H:%M:%S")} Error: #{message}") if @user_log_fd != nil
+      @log.err(message)
+    when :alert;
+      puts("#{Time.now.strftime("%Y-%m-%dT%H:%M:%S")} Alert: #{message}") if @debug
+      @user_log_fd.puts("#{Time.now.strftime("%Y-%m-%dT%H:%M:%S")} Alert: #{message}") if @user_log_fd != nil
+      @log.alert(message)
+    else
+      puts("#{Time.now.strftime("%Y-%m-%dT%H:%M:%S")} #{level}: #{message}") if @debug
+      @user_log_fd.puts("#{Time.now.strftime("%Y-%m-%dT%H:%M:%S")} #{level}: #{message}") if @user_log_fd != nil     
+      @log.notice("#{level}: #{message}")
+    end
+  end
+end
+
+
+#Tfr_handler.new("rob.burrowes.cer.auckland.ac.nz_27782_20130903T110228.tfr")
+Tfr_handler.new(ARGV[0])
+
